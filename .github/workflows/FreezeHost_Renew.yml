@@ -2,7 +2,7 @@ name: FreezeHost 续期
 
 on:
   schedule:
-    - cron: '00 1 26 6 *'   # FREEZEHOST_DISCORD_TOKEN_1 - 下一次: 2026-06-26 16:00 UTC
+    - cron: '29 1 26 6 *'   # FREEZEHOST_DISCORD_TOKEN_1 - 下一次: 2026-06-26 12:29 UTC
   workflow_dispatch:
     inputs:
       token_number:
