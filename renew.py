@@ -396,8 +396,12 @@ def process_server(page, server_id: str) -> dict:
         page.wait_for_timeout(3000)
 
         status_text = page.evaluate("""() => {
-            const el = document.getElementById('renewal-status-console');
-            return el ? el.innerText.trim() : null;
+            const ids = ['renewal-status-console', 'server-timer-status'];
+            for (const id of ids) {
+                const el = document.getElementById(id);
+                if (el && el.innerText.trim()) return el.innerText.trim();
+            }
+            return null;
         }""")
         log_info(f"[{server_id}] 续期状态: {status_text or '(空)'}")
 
@@ -423,10 +427,13 @@ def process_server(page, server_id: str) -> dict:
         }""")
 
         if not (renew_href and renew_href.get("href")):
-            # 尝试点击外链图标
+            # 旧版 UI 是 <i class="fa-external-link-alt"> 图标；
+            # 新版 UI 已改成 <button id="renew-link-trigger" onclick="showRenewalInfo()">
             page.evaluate("""() => {
-                const icon = document.querySelector('i.fa-external-link-alt');
-                if (icon) { (icon.closest('button') || icon.parentElement || icon).click(); return; }
+                const trigger = document.getElementById('renew-link-trigger')
+                    || document.querySelector('[onclick*="showRenewalInfo"]')
+                    || document.querySelector('i.fa-external-link-alt');
+                if (trigger) { (trigger.closest('button') || trigger).click(); return; }
                 if (typeof reviewAction === 'function') reviewAction('done');
             }""")
             page.wait_for_timeout(2000)
@@ -434,6 +441,10 @@ def process_server(page, server_id: str) -> dict:
             renew_href = page.evaluate("""() => {
                 const rl = document.getElementById('renew-link-modal');
                 if (rl) { const h = rl.getAttribute('href'); if (h && h !== '#') return {href:h, text:rl.innerText.trim()}; }
+                for (const a of document.querySelectorAll('a[href*="renew"]')) {
+                    const h = a.getAttribute('href');
+                    if (h && h.includes('renew') && h !== '#') return {href:h, text:a.innerText.trim()};
+                }
                 return null;
             }""")
 
@@ -444,6 +455,21 @@ def process_server(page, server_id: str) -> dict:
             }""")
 
         if not (renew_href and renew_href.get("href")):
+            # 仍找不到：把弹窗/疑似容器的 HTML 片段记录下来，方便下次根据日志精确定位
+            # 新版页面已改成弹窗交互（甚至可能是 coins 兑换流程），需要人工核对一次
+            diag_html = page.evaluate("""() => {
+                const candidates = [
+                    document.getElementById('renew-link-modal'),
+                    document.getElementById('renewal-info'),
+                    document.querySelector('[id*="modal"]'),
+                    document.querySelector('[class*="modal"]:not([class*="hidden"])'),
+                ];
+                for (const c of candidates) { if (c) return c.outerHTML.slice(0, 3000); }
+                return null;
+            }""")
+            if diag_html:
+                log_warn(f"[{server_id}] 未找到续期链接，疑似弹窗内容片段: {diag_html}")
+            take_screenshot(page, f"renew-link-missing-{server_id}")
             raise RuntimeError("未找到续期链接")
 
         btn_text = renew_href.get("text", "")
@@ -469,8 +495,12 @@ def process_server(page, server_id: str) -> dict:
                 page.goto(server_url, wait_until="networkidle")
                 page.wait_for_timeout(5000)
                 after_text = page.evaluate("""() => {
-                    const el = document.getElementById('renewal-status-console');
-                    return el ? el.innerText.trim() : null;
+                    const ids = ['renewal-status-console', 'server-timer-status'];
+                    for (const id of ids) {
+                        const el = document.getElementById(id);
+                        if (el && el.innerText.trim()) return el.innerText.trim();
+                    }
+                    return null;
                 }""")
                 log_info(f"[{server_id}] 续期后状态文本: {after_text}")
                 result["after"] = parse_remaining(after_text)
