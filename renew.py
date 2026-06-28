@@ -4,23 +4,29 @@ import os
 import re
 import sys
 import json
+import time
 import base64
+import random
 import traceback
 from datetime import datetime, timezone, timedelta
 from urllib.request import Request, urlopen
 from urllib.parse import urljoin
 from pathlib import Path
 
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+# CloakBrowser 源码级指纹伪装，与 runfc 完全一致
+from cloakbrowser import launch
 
 DISCORD_TOKEN = os.environ.get("FREEZEHOST_DISCORD_TOKEN", "").strip()
 TG_BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID    = os.environ.get("TG_CHAT_ID", "").strip()
 
-TIMEOUT        = 60_000
+# 代理：Xray 本地 SOCKS5（与 runfc 完全一致）
+PROXY_SERVER = "socks5://127.0.0.1:10808"
+
+TIMEOUT          = 60_000
 MAX_SITE_RETRIES = 3
-RETRY_WAIT     = 30_000          # ms between retries when site is down
-SCREENSHOT_DIR = Path("screenshots")
+RETRY_WAIT       = 30_000
+SCREENSHOT_DIR   = Path("screenshots")
 SCREENSHOT_DIR.mkdir(exist_ok=True)
 
 BASE_URL   = "https://free.freezehost.pro"
@@ -29,6 +35,7 @@ VIEWPORT_H = 753
 
 _SENSITIVE_VALUES: set[str] = set()
 _SERVER_INDEX: dict[str, int] = {}
+
 
 def _register_sensitive(*values):
     for v in values:
@@ -64,6 +71,73 @@ def log_info(msg: str):  print(f"[INFO] {_mask(msg)}")
 def log_warn(msg: str):  print(f"[WARN] {_mask(msg)}")
 def log_error(msg: str): print(f"[ERROR] {_mask(msg)}")
 
+
+
+def wait_for_page_settle(page, settle_timeout=12) -> None:
+    """等待 domcontentloaded 之后页面内容真正就绪"""
+    deadline = time.time() + settle_timeout
+    while time.time() < deadline:
+        try:
+            body = page.inner_text("body") or ""
+        except Exception:
+            body = ""
+        if len(body.strip()) > 100:
+            log_info("  页面已稳定（内容就绪）")
+            return
+        time.sleep(0.5)
+    log_info("  页面稳定等待超时，继续执行...")
+
+
+def navigate(page, url, timeout=60) -> bool:
+    """导航到目标页面（站点无 CF 验证，纯 Discord OAuth 登录）"""
+    log_info(f"导航到: {url}")
+    try:
+        page.goto(url, timeout=30000, wait_until="domcontentloaded")
+    except Exception as e:
+        log_warn(f"goto 超时/异常: {e}，继续等待...")
+
+    wait_for_page_settle(page, settle_timeout=12)
+    return True
+
+
+# ── 工具函数 ──────────────────────────────────────────────────────────────────
+def take_screenshot(page, name: str) -> bytes | None:
+    try:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = SCREENSHOT_DIR / f"{ts}_{name}.png"
+        page.screenshot(path=str(path), full_page=False)
+        log_info(f"📸 截图: {path}")
+        return path.read_bytes()
+    except Exception as e:
+        log_warn(f"截图失败: {e}")
+        return None
+
+
+def merge_screenshots(browser, buffers: list[bytes]) -> bytes | None:
+    if not buffers:
+        return None
+    log_info("合并截图...")
+    pg = browser.new_page()
+    try:
+        imgs = "".join(
+            f'<img src="data:image/png;base64,{base64.b64encode(b).decode()}" '
+            f'style="width:100%;border-radius:8px;border:2px solid #202225;'
+            f'box-shadow:0 4px 6px rgba(0,0,0,.3);" />'
+            for b in buffers
+        )
+        pg.set_content(
+            f'<body style="margin:0;padding:15px;background:#2f3136;'
+            f'display:flex;flex-direction:column;gap:15px;">{imgs}</body>'
+        )
+        time.sleep(0.5)
+        return pg.screenshot(full_page=True)
+    except Exception as e:
+        log_warn(f"截图合并失败: {e}")
+        return None
+    finally:
+        pg.close()
+
+
 def parse_remaining(text: str) -> str | None:
     if not text:
         return None
@@ -94,35 +168,6 @@ def remaining_total_days(text: str) -> float | None:
     hours = float(h.group(1)) if h else 0.0
     return days + hours / 24.0
 
-def extract_email(page) -> str | None:
-    try:
-        log_info("打开 Settings 页面获取邮箱...")
-        page.goto(f"{BASE_URL}/settings", wait_until="networkidle")
-        page.wait_for_timeout(3000)
-        email = page.evaluate(r"""() => {
-            const labels = document.querySelectorAll('p');
-            for (const label of labels) {
-                if (label.textContent.trim().toLowerCase().includes('email address')) {
-                    const next = label.nextElementSibling;
-                    if (next) {
-                        const text = next.textContent.trim();
-                        if (text.includes('@')) return text;
-                    }
-                }
-            }
-            const body = document.body.innerText;
-            const m = body.match(/[\w.+-]+@[\w.-]+\.\w+/);
-            return m ? m[0] : null;
-        }""")
-        if email:
-            _register_sensitive(email)
-            log_info(f"邮箱获取成功: {email}")
-            return email
-        log_warn("Settings 页面未找到邮箱")
-        return None
-    except Exception as e:
-        log_warn(f"获取邮箱失败: {e}")
-        return None
 
 def send_tg(caption: str, image_bytes: bytes | None = None):
     if not TG_CHAT_ID or not TG_BOT_TOKEN:
@@ -160,45 +205,9 @@ def send_tg(caption: str, image_bytes: bytes | None = None):
     except Exception as e:
         log_warn(f"TG 推送异常: {e}")
 
-def take_screenshot(page, name: str) -> bytes | None:
-    try:
-        page.set_viewport_size({"width": VIEWPORT_W, "height": VIEWPORT_H})
-        page.wait_for_timeout(500)
-        path = SCREENSHOT_DIR / f"{name}.png"
-        page.screenshot(path=str(path), full_page=False)
-        log_info(f"截图已保存: {path}")
-        return path.read_bytes()
-    except Exception as e:
-        log_warn(f"截图失败: {e}")
-        return None
 
-
-def merge_screenshots(browser, buffers: list[bytes]) -> bytes | None:
-    if not buffers:
-        return None
-    log_info("合并截图...")
-    pg = browser.new_page(viewport={"width": VIEWPORT_W, "height": VIEWPORT_H})
-    try:
-        imgs = "".join(
-            f'<img src="data:image/png;base64,{base64.b64encode(b).decode()}" '
-            f'style="width:100%;border-radius:8px;border:2px solid #202225;'
-            f'box-shadow:0 4px 6px rgba(0,0,0,.3);" />'
-            for b in buffers
-        )
-        pg.set_content(
-            f'<body style="margin:0;padding:15px;background:#2f3136;'
-            f'display:flex;flex-direction:column;gap:15px;">{imgs}</body>'
-        )
-        pg.wait_for_timeout(500)
-        return pg.screenshot(full_page=True)
-    except Exception as e:
-        log_warn(f"截图合并失败: {e}")
-        return None
-    finally:
-        pg.close()
-
+# ── FreezeHost 特有逻辑 ───────────────────────────────────────────────────────
 def check_site_down(page) -> bool:
-    """Detect FreezeHost 'CONNECTION TO THE MANAGEMENT SERVICES LOST' or similar outage screens."""
     try:
         return page.evaluate("""() => {
             const body = document.body ? document.body.innerText : '';
@@ -212,43 +221,42 @@ def check_site_down(page) -> bool:
 
 
 def wait_for_site_ready(page) -> bool:
-    """Try loading FreezeHost up to MAX_SITE_RETRIES times, handling outage screens.
-    Returns True if site became available, False if still down after all retries."""
     for attempt in range(1, MAX_SITE_RETRIES + 1):
         log_info(f"加载 FreezeHost 首页 (尝试 {attempt}/{MAX_SITE_RETRIES})...")
         try:
-            page.goto(BASE_URL, wait_until="domcontentloaded", timeout=TIMEOUT)
-        except PlaywrightTimeout:
-            log_warn(f"首页加载超时 (尝试 {attempt})")
+            ok = navigate(page, BASE_URL)
+            if not ok:
+                log_warn(f"页面加载未成功 (尝试 {attempt})")
+                if attempt < MAX_SITE_RETRIES:
+                    time.sleep(RETRY_WAIT / 1000)
+                continue
+        except Exception as e:
+            log_warn(f"首页加载超时/异常 (尝试 {attempt}): {e}")
             if attempt < MAX_SITE_RETRIES:
-                page.wait_for_timeout(RETRY_WAIT)
+                time.sleep(RETRY_WAIT / 1000)
             continue
 
-        page.wait_for_timeout(3000)
+        time.sleep(3)
 
         if check_site_down(page):
             log_warn(f"FreezeHost 后端服务不可用 (尝试 {attempt})")
             take_screenshot(page, f"site-down-{attempt}")
-
-            # Try clicking the "Retry Now" button on the page itself
             try:
                 retry_btn = page.locator('button:has-text("Retry Now")')
                 if retry_btn.is_visible():
                     log_info("点击页面 Retry Now 按钮...")
                     retry_btn.click()
-                    page.wait_for_timeout(10_000)
+                    time.sleep(10)
                     if not check_site_down(page):
                         log_info("站点恢复正常")
                         return True
             except Exception:
                 pass
-
             if attempt < MAX_SITE_RETRIES:
                 log_info(f"等待 {RETRY_WAIT // 1000} 秒后重试...")
-                page.wait_for_timeout(RETRY_WAIT)
+                time.sleep(RETRY_WAIT / 1000)
             continue
 
-        # Check if the login button is present
         try:
             login_visible = page.locator('span.text-lg:has-text("Login with Discord")').is_visible()
             if login_visible:
@@ -257,7 +265,6 @@ def wait_for_site_ready(page) -> bool:
         except Exception:
             pass
 
-        # Page loaded but no login button and not the known error page — might be OK
         log_info("首页已加载（未检测到宕机页面）")
         return True
 
@@ -266,7 +273,7 @@ def wait_for_site_ready(page) -> bool:
 
 def handle_oauth_page(page):
     log_info("进入 OAuth 授权页处理")
-    page.wait_for_timeout(2000)
+    time.sleep(2)
 
     for _ in range(20):
         if "discord.com" not in page.url:
@@ -303,19 +310,19 @@ def handle_oauth_page(page):
             });
             scrollTo(0, document.body.scrollHeight);
         }""")
-        page.wait_for_timeout(800)
+        time.sleep(0.8)
 
     for _ in range(10):
         if "discord.com" not in page.url:
             return
-        for sel in ['button:has-text("Authorize")','button:has-text("授权")',
-                    'button[type="submit"]','div[class*="footer"] button','button[class*="primary"]']:
+        for sel in ['button:has-text("Authorize")', 'button:has-text("授权")',
+                    'button[type="submit"]', 'div[class*="footer"] button', 'button[class*="primary"]']:
             try:
                 btn = page.locator(sel).last
                 if not btn.is_visible():
                     continue
                 text = btn.inner_text().strip()
-                if any(k in text.lower() for k in ("取消","cancel","deny")):
+                if any(k in text.lower() for k in ("取消", "cancel", "deny")):
                     continue
                 if "scroll" in text.lower():
                     page.evaluate("""() => {
@@ -323,19 +330,51 @@ def handle_oauth_page(page):
                             if (el.scrollHeight > el.clientHeight + 5) el.scrollTop = el.scrollHeight;
                         }); scrollTo(0, document.body.scrollHeight);
                     }""")
-                    page.wait_for_timeout(1000)
+                    time.sleep(1)
                     break
                 if btn.is_disabled():
-                    page.wait_for_timeout(1000)
+                    time.sleep(1)
                     break
                 btn.click()
-                page.wait_for_timeout(2000)
+                time.sleep(2)
                 if "discord.com" not in page.url:
                     return
                 break
             except Exception:
                 continue
-        page.wait_for_timeout(1500)
+        time.sleep(1.5)
+
+
+def extract_email(page) -> str | None:
+    try:
+        log_info("打开 Settings 页面获取邮箱...")
+        navigate(page, f"{BASE_URL}/settings")
+        time.sleep(3)
+        email = page.evaluate(r"""() => {
+            const labels = document.querySelectorAll('p');
+            for (const label of labels) {
+                if (label.textContent.trim().toLowerCase().includes('email address')) {
+                    const next = label.nextElementSibling;
+                    if (next) {
+                        const text = next.textContent.trim();
+                        if (text.includes('@')) return text;
+                    }
+                }
+            }
+            const body = document.body.innerText;
+            const m = body.match(/[\w.+-]+@[\w.-]+\.\w+/);
+            return m ? m[0] : null;
+        }""")
+        if email:
+            _register_sensitive(email)
+            log_info(f"邮箱获取成功: {email}")
+            return email
+        log_warn("Settings 页面未找到邮箱")
+        return None
+    except Exception as e:
+        log_warn(f"获取邮箱失败: {e}")
+        return None
+
 
 def discover_server_ids(page) -> list[str]:
     for attempt in range(3):
@@ -349,12 +388,12 @@ def discover_server_ids(page) -> list[str]:
         page.on("request", on_req)
         if attempt == 0:
             log_info("加载 Dashboard 发现服务器...")
-            page.goto(f"{BASE_URL}/dashboard", wait_until="networkidle")
+            navigate(page, f"{BASE_URL}/dashboard")
         else:
-            log_info(f"第 {attempt+1} 次重试...")
+            log_info(f"第 {attempt + 1} 次重试...")
             page.reload(wait_until="networkidle")
 
-        page.wait_for_timeout(5000)
+        time.sleep(5)
         page.remove_listener("request", on_req)
 
         js_ids = page.evaluate(r"""() => {
@@ -377,23 +416,23 @@ def discover_server_ids(page) -> list[str]:
             log_info(f"发现 {len(all_ids)} 台服务器")
             return sorted(all_ids)
 
-        log_warn(f"第 {attempt+1} 次未发现服务器")
-        take_screenshot(page, f"dashboard-empty-{attempt+1}")
+        log_warn(f"第 {attempt + 1} 次未发现服务器")
+        take_screenshot(page, f"dashboard-empty-{attempt + 1}")
         if attempt < 2:
-            page.wait_for_timeout(3000)
+            time.sleep(3)
 
     return []
 
+
 def process_server(page, server_id: str) -> dict:
-    tag = _server_label(server_id)
     server_url = f"{BASE_URL}/server-console?id={server_id}"
     result = dict(server_id=server_id, status="unknown", before=None, after=None,
                   emoji="❓", status_label="未知", detail="")
 
     log_info(f"[{server_id}] 开始处理")
     try:
-        page.goto(server_url, wait_until="networkidle")
-        page.wait_for_timeout(3000)
+        navigate(page, server_url)
+        time.sleep(3)
 
         status_text = page.evaluate("""() => {
             const ids = ['renewal-status-console', 'server-timer-status'];
@@ -415,7 +454,7 @@ def process_server(page, server_id: str) -> dict:
                           detail=remaining_before or f"{total_days:.1f}天")
             return result
 
-        # ── 查找续期链接 ─────────────────────────────────
+        # 查找续期链接
         renew_href = page.evaluate("""() => {
             const rl = document.getElementById('renew-link-modal');
             if (rl) { const h = rl.getAttribute('href'); if (h && h !== '#') return {href:h, text:rl.innerText.trim()}; }
@@ -427,8 +466,6 @@ def process_server(page, server_id: str) -> dict:
         }""")
 
         if not (renew_href and renew_href.get("href")):
-            # 旧版 UI 是 <i class="fa-external-link-alt"> 图标；
-            # 新版 UI 已改成 <button id="renew-link-trigger" onclick="showRenewalInfo()">
             page.evaluate("""() => {
                 const trigger = document.getElementById('renew-link-trigger')
                     || document.querySelector('[onclick*="showRenewalInfo"]')
@@ -436,8 +473,7 @@ def process_server(page, server_id: str) -> dict:
                 if (trigger) { (trigger.closest('button') || trigger).click(); return; }
                 if (typeof reviewAction === 'function') reviewAction('done');
             }""")
-            page.wait_for_timeout(2000)
-
+            time.sleep(2)
             renew_href = page.evaluate("""() => {
                 const rl = document.getElementById('renew-link-modal');
                 if (rl) { const h = rl.getAttribute('href'); if (h && h !== '#') return {href:h, text:rl.innerText.trim()}; }
@@ -455,8 +491,6 @@ def process_server(page, server_id: str) -> dict:
             }""")
 
         if not (renew_href and renew_href.get("href")):
-            # 仍找不到：把弹窗/疑似容器的 HTML 片段记录下来，方便下次根据日志精确定位
-            # 新版页面已改成弹窗交互（甚至可能是 coins 兑换流程），需要人工核对一次
             diag_html = page.evaluate("""() => {
                 const candidates = [
                     document.getElementById('renew-link-modal'),
@@ -481,19 +515,20 @@ def process_server(page, server_id: str) -> dict:
                               detail=remaining_before or btn_text)
                 return result
 
-        # ── 执行续期 ─────────────────────────────────────
+        # 执行续期（用 page.goto 直接跳转，不经过 navigate，避免误判 CF）
+        log_info(f"[{server_id}] 执行续期跳转: {href}")
         page.goto(urljoin(page.url, href), wait_until="domcontentloaded")
         try:
             page.wait_for_url(lambda u: "/dashboard" in u or "/server-console" in u, timeout=30000)
-        except PlaywrightTimeout:
+        except Exception:
             pass
 
         url = page.url
         if "success=RENEWED" in url:
             log_info(f"[{server_id}] 续期成功！")
             try:
-                page.goto(server_url, wait_until="networkidle")
-                page.wait_for_timeout(5000)
+                navigate(page, server_url)
+                time.sleep(5)
                 after_text = page.evaluate("""() => {
                     const ids = ['renewal-status-console', 'server-timer-status'];
                     for (const id of ids) {
@@ -526,177 +561,180 @@ def process_server(page, server_id: str) -> dict:
 
     return result
 
-#  主流程
+
+# ── 主流程 ────────────────────────────────────────────────────────────────────
 def run():
     if not DISCORD_TOKEN:
         raise RuntimeError("缺少 FREEZEHOST_DISCORD_TOKEN")
 
-    log_info("启动浏览器 (WARP 系统级代理)")
+    log_info("启动 CloakBrowser（源码级指纹伪装 + Xray 代理）...")
 
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
-        page = browser.new_page(viewport={"width": VIEWPORT_W, "height": VIEWPORT_H})
-        page.set_default_timeout(TIMEOUT)
-        log_info("浏览器就绪")
+    # headed + humanize + proxy：与 runfc 完全一致
+    # geoip=True：根据代理 IP 自动匹配时区/语言，消除指纹矛盾
+    browser = launch(
+        headless=False,
+        humanize=True,
+        proxy=PROXY_SERVER,
+        geoip=True,
+    )
+    page = browser.new_page()
+    page.set_default_timeout(TIMEOUT)
+    log_info("CloakBrowser 就绪")
 
-        display_name = "未知用户"
+    display_name = "未知用户"
 
+    try:
+        # 出口 IP 验证
+        log_info("验证出口 IP（通过代理）...")
         try:
-            # ── 出口 IP ───────────────────────────────────
-            log_info("验证出口 IP...")
-            try:
-                ip = json.loads(page.goto("https://api.ipify.org?format=json",
-                                          wait_until="domcontentloaded").text()).get("ip", "?")
-                log_info(f"出口 IP: {ip}")
-            except Exception:
-                log_warn("IP 验证超时")
+            page.goto("https://api.ipify.org?format=json",
+                      wait_until="domcontentloaded", timeout=15000)
+            ip = json.loads(page.inner_text("body") or "{}").get("ip", "?")
+            log_info(f"出口 IP: {ip}")
+        except Exception:
+            log_warn("IP 验证超时")
 
-            # ── 检测站点可用性（带重试） ─────────────────
-            log_info("打开 FreezeHost 登录页")
-            if not wait_for_site_ready(page):
-                buf = take_screenshot(page, "site-down-final")
-                msg = (
-                    f"用户：{display_name}\n"
-                    f"🔌 FreezeHost 站点宕机\n"
-                    f"CONNECTION TO THE MANAGEMENT SERVICES LOST\n"
-                    f"已重试 {MAX_SITE_RETRIES} 次仍无法连接\n\n"
-                    f"FreezeHost Auto Renew"
-                )
-                send_tg(msg, buf)
-                log_warn("站点宕机，本次跳过续期")
-                return   # Exit gracefully — not a script error
+        # 加载首页
+        log_info("打开 FreezeHost 登录页")
+        if not wait_for_site_ready(page):
+            buf = take_screenshot(page, "site-down-final")
+            msg = (
+                f"用户：{display_name}\n"
+                f"🔌 FreezeHost 站点宕机\n"
+                f"CONNECTION TO THE MANAGEMENT SERVICES LOST\n"
+                f"已重试 {MAX_SITE_RETRIES} 次仍无法连接\n\n"
+                f"FreezeHost Auto Renew"
+            )
+            send_tg(msg, buf)
+            log_warn("站点宕机，本次跳过续期")
+            return
 
-            # ── 登录 ─────────────────────────────────────
-            page.click('span.text-lg:has-text("Login with Discord")', timeout=15_000)
+        # 点击 Discord 登录
+        page.click('span.text-lg:has-text("Login with Discord")', timeout=15_000)
 
-            confirm_btn = page.locator("button#confirm-login")
-            confirm_btn.wait_for(state="visible")
-            confirm_btn.click()
-            log_info("已接受服务条款")
+        confirm_btn = page.locator("button#confirm-login")
+        confirm_btn.wait_for(state="visible")
+        confirm_btn.click()
+        log_info("已接受服务条款")
 
-            page.wait_for_url(re.compile(r"discord\.com"), timeout=15000)
-            log_info("已到达 Discord")
+        page.wait_for_url(re.compile(r"discord\.com"), timeout=15000)
+        log_info("已到达 Discord")
 
-            # ── 注入 Token ────────────────────────────────
-            page.evaluate("""(token) => {
-                const f = document.createElement('iframe');
-                f.style.display = 'none';
-                document.body.appendChild(f);
-                f.contentWindow.localStorage.setItem('token', '"'+token+'"');
-                try { localStorage.setItem('token', '"'+token+'"'); } catch(e) {}
-                document.body.removeChild(f);
-            }""", DISCORD_TOKEN)
-            log_info("Token 已注入")
+        # 注入 Token
+        page.evaluate("""(token) => {
+            const f = document.createElement('iframe');
+            f.style.display = 'none';
+            document.body.appendChild(f);
+            f.contentWindow.localStorage.setItem('token', '"'+token+'"');
+            try { localStorage.setItem('token', '"'+token+'"'); } catch(e) {}
+            document.body.removeChild(f);
+        }""", DISCORD_TOKEN)
+        log_info("Token 已注入")
 
-            page.reload(wait_until="domcontentloaded")
-            page.wait_for_timeout(3000)
+        page.reload(wait_until="domcontentloaded")
+        time.sleep(3)
 
-            if re.search(r"discord\.com/login", page.url):
-                take_screenshot(page, "token-failed")
-                raise RuntimeError("Token 登录失败")
+        if re.search(r"discord\.com/login", page.url):
+            take_screenshot(page, "token-failed")
+            raise RuntimeError("Token 登录失败")
 
-            log_info("Token 注入成功")
+        log_info("Token 注入成功")
 
-            # ── OAuth ─────────────────────────────────────
-            try:
-                page.wait_for_url(re.compile(r"discord\.com/oauth2/authorize"), timeout=6000)
-                page.wait_for_timeout(2000)
-                if "discord.com" in page.url:
-                    handle_oauth_page(page)
-                if "discord.com" in page.url:
-                    try:
-                        page.wait_for_url(re.compile(r"free\.freezehost\.pro"), timeout=20000)
-                    except PlaywrightTimeout:
-                        take_screenshot(page, "oauth-stuck")
-                        raise RuntimeError("OAuth 未跳转")
-            except PlaywrightTimeout:
-                if "discord.com" in page.url:
-                    raise RuntimeError("OAuth 超时")
-
-            # ── Dashboard ─────────────────────────────────
-            try:
-                page.wait_for_url(lambda u: "/callback" in u or "/dashboard" in u, timeout=10000)
-            except PlaywrightTimeout:
-                pass
-            if "/callback" in page.url:
-                page.wait_for_url(re.compile(r"/dashboard"), timeout=15000)
-            if "/dashboard" not in page.url:
-                take_screenshot(page, "not-dashboard")
-                raise RuntimeError("未到达 Dashboard")
-
-            log_info("登录成功")
-
-            # ── 邮箱（唯一显示名） ───────────────────────
-            email = extract_email(page)
-            if email:
-                display_name = email
-            else:
-                log_warn("邮箱获取失败，TG 将显示「未知用户」")
-
-            # ── 发现服务器 ────────────────────────────────
-            server_ids = discover_server_ids(page)
-            if not server_ids:
-                buf = take_screenshot(page, "no-servers")
-                send_tg(f"用户：{display_name}\n⚠️ 未发现服务器\n\nFreezeHost Auto Renew", buf)
-                return
-
-            # ── 逐台处理 ─────────────────────────────────
-            results, screenshots = [], []
-            for sid in server_ids:
-                log_info("=" * 50)
-                res = process_server(page, sid)
-                results.append(res)
-                buf = take_screenshot(page, f"server-{_SERVER_INDEX.get(sid, 0)}")
-                if buf:
-                    screenshots.append(buf)
-
-            # ── 合并截图 ─────────────────────────────────
-            final_img = (screenshots[0] if len(screenshots) == 1
-                         else merge_screenshots(browser, screenshots) if screenshots
-                         else None)
-
-            # ── 写入 renew_result.json 供 workflow 读取 ──
-            try:
-                all_days = []
-                for r in results:
-                    after_raw   = r.get("after_raw") or ""
-                    after_days  = remaining_total_days(after_raw)
-                    before_days = remaining_total_days(r.get("before") or "")
-                    if r.get("status") == "renewed":
-                        # 续期成功：必须用续期后的剩余天数；after读不到则跳过该服务器
-                        if after_days:
-                            log_info(f"[{r['server_id']}] 用续期后天数计入统计: {after_days:.2f} 天")
-                            all_days.append(after_days)
-                        else:
-                            log_warn(f"[{r['server_id']}] 续期成功但 after 未读到，跳过该服务器天数统计")
-                    else:
-                        d = after_days or before_days
-                        if d:
-                            all_days.append(d)
-                if all_days:
-                    with open("renew_result.json", "w") as f:
-                        json.dump({"min_remaining_days": min(all_days)}, f)
-                    log_info(f"写入 renew_result.json: 最小剩余天数 = {min(all_days):.2f}")
-            except Exception as ex:
-                log_warn(f"写入 renew_result.json 失败: {ex}")
-
-            # ── TG 推送（完整信息） ──────────────────────
-            lines = []
-            for r in results:
-                s = f"服务器: {r['server_id']} | {r['emoji']}{r['status_label']}"
-                if r["detail"]:
-                    s += f" {r['detail']}"
-                lines.append(s)
-
-            send_tg("\n".join([f"用户：{display_name}", *lines, "", "FreezeHost Auto Renew"]), final_img)
-            log_info("所有服务器处理完毕")
-
+        # OAuth
+        try:
+            page.wait_for_url(re.compile(r"discord\.com/oauth2/authorize"), timeout=6000)
+            time.sleep(2)
+            if "discord.com" in page.url:
+                handle_oauth_page(page)
+            if "discord.com" in page.url:
+                try:
+                    page.wait_for_url(re.compile(r"free\.freezehost\.pro"), timeout=20000)
+                except Exception:
+                    take_screenshot(page, "oauth-stuck")
+                    raise RuntimeError("OAuth 未跳转")
         except Exception as e:
-            buf = take_screenshot(page, "fatal-error")
-            send_tg(f"用户：{display_name}\n❌ 异常: {e}\n\nFreezeHost Auto Renew", buf)
-            raise
-        finally:
-            browser.close()
+            if "discord.com" in page.url:
+                raise RuntimeError(f"OAuth 超时: {e}")
+
+        # Dashboard
+        try:
+            page.wait_for_url(lambda u: "/callback" in u or "/dashboard" in u, timeout=10000)
+        except Exception:
+            pass
+        if "/callback" in page.url:
+            page.wait_for_url(re.compile(r"/dashboard"), timeout=15000)
+        if "/dashboard" not in page.url:
+            take_screenshot(page, "not-dashboard")
+            raise RuntimeError("未到达 Dashboard")
+
+        log_info("登录成功")
+
+        email = extract_email(page)
+        if email:
+            display_name = email
+        else:
+            log_warn("邮箱获取失败，TG 将显示「未知用户」")
+
+        server_ids = discover_server_ids(page)
+        if not server_ids:
+            buf = take_screenshot(page, "no-servers")
+            send_tg(f"用户：{display_name}\n⚠️ 未发现服务器\n\nFreezeHost Auto Renew", buf)
+            return
+
+        results, screenshots = [], []
+        for sid in server_ids:
+            log_info("=" * 50)
+            res = process_server(page, sid)
+            results.append(res)
+            buf = take_screenshot(page, f"server-{_SERVER_INDEX.get(sid, 0)}")
+            if buf:
+                screenshots.append(buf)
+
+        final_img = (screenshots[0] if len(screenshots) == 1
+                     else merge_screenshots(browser, screenshots) if screenshots
+                     else None)
+
+        # 写入 renew_result.json 供 workflow 读取
+        try:
+            all_days = []
+            for r in results:
+                after_raw   = r.get("after_raw") or ""
+                after_days  = remaining_total_days(after_raw)
+                before_days = remaining_total_days(r.get("before") or "")
+                if r.get("status") == "renewed":
+                    if after_days:
+                        log_info(f"[{r['server_id']}] 用续期后天数计入统计: {after_days:.2f} 天")
+                        all_days.append(after_days)
+                    else:
+                        log_warn(f"[{r['server_id']}] 续期成功但 after 未读到，跳过该服务器天数统计")
+                else:
+                    d = after_days or before_days
+                    if d:
+                        all_days.append(d)
+            if all_days:
+                with open("renew_result.json", "w") as f:
+                    json.dump({"min_remaining_days": min(all_days)}, f)
+                log_info(f"写入 renew_result.json: 最小剩余天数 = {min(all_days):.2f}")
+        except Exception as ex:
+            log_warn(f"写入 renew_result.json 失败: {ex}")
+
+        lines = []
+        for r in results:
+            s = f"服务器: {r['server_id']} | {r['emoji']}{r['status_label']}"
+            if r["detail"]:
+                s += f" {r['detail']}"
+            lines.append(s)
+
+        send_tg("\n".join([f"用户：{display_name}", *lines, "", "FreezeHost Auto Renew"]), final_img)
+        log_info("所有服务器处理完毕")
+
+    except Exception as e:
+        buf = take_screenshot(page, "fatal-error")
+        send_tg(f"用户：{display_name}\n❌ 异常: {e}\n\nFreezeHost Auto Renew", buf)
+        raise
+    finally:
+        time.sleep(3)
+        browser.close()
 
 
 if __name__ == "__main__":
