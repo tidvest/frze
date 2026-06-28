@@ -637,16 +637,24 @@ def run():
             return
 
         # 关闭可能存在的 Cookie/GDPR 同意弹窗（曾遮挡登录按钮导致 confirm-login 一直 hidden）
-        dismiss_cookie_consent(page)
+        dismiss_cookie_consent(page, timeout=5)
 
         # 点击 Discord 登录
         page.click('span.text-lg:has-text("Login with Discord")', timeout=15_000)
 
-        # 点击后再检测一次（弹窗有时延迟出现/二次出现）
-        dismiss_cookie_consent(page, timeout=4)
-
+        # Google FC 同意弹窗是异步脚本注入的，经常在页面"稳定"之后才延迟出现，
+        # 所以不能只检测一次就不管了：循环等待 confirm-login 出现，期间持续尝试关闭弹窗
         confirm_btn = page.locator("button#confirm-login")
-        confirm_btn.wait_for(state="visible")
+        login_modal_deadline = time.time() + 60
+        while time.time() < login_modal_deadline:
+            if confirm_btn.is_visible(timeout=500):
+                break
+            dismiss_cookie_consent(page, timeout=2)
+            time.sleep(0.5)
+        else:
+            take_screenshot(page, "confirm-login-timeout")
+            raise RuntimeError("等待 confirm-login 按钮超时（可能被同意弹窗持续遮挡）")
+
         confirm_btn.click()
         log_info("已接受服务条款")
 
