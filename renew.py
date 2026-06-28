@@ -487,6 +487,31 @@ def discover_server_ids(page) -> list[str]:
     return []
 
 
+def fetch_internal_id(page, server_id: str) -> str | None:
+    """
+    通过 /api/serverdetails 拿 internal_id。
+    这个站的续费按钮(#action-link-modal) href 属性永远是 "#"，
+    真正的跳转地址是 loadServerDetails() 里动态绑定到 .onclick 的：
+        renewLinkModal.onclick = () => location.href = `../renew?id=${internal_id}`
+    读 href 属性 / 正则扫整页 HTML 在这个站上根本读不到任何东西（DOM 里
+    压根不存在 "renew?id=..." 这种字面字符串），所以改成直接调用页面
+    自己也在用的这个接口拿 internal_id，自己拼 URL，最稳。
+    """
+    try:
+        data = page.evaluate(f"""async () => {{
+            try {{
+                const r = await fetch('/api/serverdetails?id={server_id}');
+                if (!r.ok) return null;
+                const j = await r.json();
+                return (j && j.attributes) ? j.attributes.internal_id : null;
+            }} catch (e) {{ return null; }}
+        }}""")
+        return str(data) if data else None
+    except Exception as e:
+        log_warn(f"[{server_id}] 获取 internal_id 异常: {e}")
+        return None
+
+
 def process_server(page, server_id: str) -> dict:
     server_url = f"{BASE_URL}/server-console?id={server_id}"
     result = dict(server_id=server_id, status="unknown", before=None, after=None,
@@ -517,66 +542,14 @@ def process_server(page, server_id: str) -> dict:
                           detail=remaining_before or f"{total_days:.1f}天")
             return result
 
-        # 查找续期链接
-        renew_href = page.evaluate("""() => {
-            const rl = document.getElementById('renew-link-modal');
-            if (rl) { const h = rl.getAttribute('href'); if (h && h !== '#') return {href:h, text:rl.innerText.trim()}; }
-            for (const a of document.querySelectorAll('a[href*="renew"]')) {
-                const h = a.getAttribute('href');
-                if (h && h.includes('renew') && h !== '#') return {href:h, text:a.innerText.trim()};
-            }
-            return null;
-        }""")
+        # 获取续期目标地址：不读 href（这个站上读不到），直接拿 internal_id 自己拼
+        internal_id = fetch_internal_id(page, server_id)
+        if not internal_id:
+            take_screenshot(page, f"renew-id-missing-{server_id}")
+            raise RuntimeError("未能获取 internal_id，无法构造续期链接")
 
-        if not (renew_href and renew_href.get("href")):
-            page.evaluate("""() => {
-                const trigger = document.getElementById('renew-link-trigger')
-                    || document.querySelector('[onclick*="showRenewalInfo"]')
-                    || document.querySelector('i.fa-external-link-alt');
-                if (trigger) { (trigger.closest('button') || trigger).click(); return; }
-                if (typeof reviewAction === 'function') reviewAction('done');
-            }""")
-            time.sleep(2)
-            renew_href = page.evaluate("""() => {
-                const rl = document.getElementById('renew-link-modal');
-                if (rl) { const h = rl.getAttribute('href'); if (h && h !== '#') return {href:h, text:rl.innerText.trim()}; }
-                for (const a of document.querySelectorAll('a[href*="renew"]')) {
-                    const h = a.getAttribute('href');
-                    if (h && h.includes('renew') && h !== '#') return {href:h, text:a.innerText.trim()};
-                }
-                return null;
-            }""")
-
-        if not (renew_href and renew_href.get("href")):
-            renew_href = page.evaluate(r"""() => {
-                const m = document.body.innerHTML.match(/href=["']((?:\.\.)?\/renew\?id=[a-f0-9]+)["']/i);
-                return m ? {href:m[1], text:'html-extract'} : null;
-            }""")
-
-        if not (renew_href and renew_href.get("href")):
-            diag_html = page.evaluate("""() => {
-                const candidates = [
-                    document.getElementById('renew-link-modal'),
-                    document.getElementById('renewal-info'),
-                    document.querySelector('[id*="modal"]'),
-                    document.querySelector('[class*="modal"]:not([class*="hidden"])'),
-                ];
-                for (const c of candidates) { if (c) return c.outerHTML.slice(0, 3000); }
-                return null;
-            }""")
-            if diag_html:
-                log_warn(f"[{server_id}] 未找到续期链接，疑似弹窗内容片段: {diag_html}")
-            take_screenshot(page, f"renew-link-missing-{server_id}")
-            raise RuntimeError("未找到续期链接")
-
-        btn_text = renew_href.get("text", "")
-        href = renew_href["href"]
-
-        if btn_text and "renew instance" not in btn_text.lower():
-            if not (total_days is not None and total_days <= 7):
-                result.update(status="tooearly", emoji="⏳", status_label="冷却期",
-                              detail=remaining_before or btn_text)
-                return result
+        href = f"../renew?id={internal_id}"
+        log_info(f"[{server_id}] internal_id={internal_id}")
 
         # 执行续期（用 page.goto 直接跳转，不经过 navigate，避免误判 CF）
         log_info(f"[{server_id}] 执行续期跳转: {href}")
