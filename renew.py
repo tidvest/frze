@@ -222,22 +222,58 @@ def check_site_down(page) -> bool:
 
 def dismiss_cookie_consent(page, timeout=8) -> bool:
     """
-    关闭 GDPR/广告联盟 Cookie 同意弹窗（常见于荷兰语/多语言 CMP 浮层）。
-    优先点"同意"类按钮，避免遮罩挡住后续的登录按钮。
+    关闭 GDPR/广告联盟 Cookie 同意弹窗。
+    本站使用 Google Funding Choices (FC)，按钮文案会按访问者地区自动翻译
+    （荷兰语/中文/英文等），所以优先用 FC 库固定不变的 CSS class 匹配，
+    不随语言变化；翻译文案匹配仅作兜底。点击用 force=True，防止被
+    某层透明遮罩/动画判定为不可点击而一直报错被吞掉。
     """
+    # Google Funding Choices 的"同意"主按钮，class 名固定，不随语言/地区变化
+    stable_selectors = [
+        "button.fc-cta-consent",
+        "button.fc-primary-button",
+        ".fc-consent-root button.fc-cta-consent",
+        # 其他常见 CMP 的固定选择器，兜底
+        "#onetrust-accept-btn-handler",
+        ".qc-cmp2-summary-buttons button[mode='primary']",
+    ]
     consent_texts = [
         "Toestemming geven", "Akkoord", "Accepteren",
         "Accept all", "Accept", "I Agree", "I agree", "Agree",
         "同意", "接受", "Allow all", "Allow",
     ]
+
+    def try_click(locator) -> bool:
+        try:
+            if not locator.is_visible(timeout=300):
+                return False
+        except Exception:
+            return False
+        for force in (False, True):
+            try:
+                locator.click(timeout=1500, force=force)
+                return True
+            except Exception as e:
+                log_warn(f"  点击同意按钮失败(force={force}): {e}")
+                continue
+        return False
+
     deadline = time.time() + timeout
     while time.time() < deadline:
+        for sel in stable_selectors:
+            try:
+                btn = page.locator(sel).first
+                if try_click(btn):
+                    log_info(f"已关闭 Cookie 同意弹窗（选择器: {sel}）")
+                    time.sleep(0.5)
+                    return True
+            except Exception:
+                continue
         for txt in consent_texts:
             try:
                 btn = page.locator(f'button:has-text("{txt}")').first
-                if btn.is_visible(timeout=300):
-                    btn.click(timeout=1000)
-                    log_info(f"已关闭 Cookie 同意弹窗（按钮: {txt}）")
+                if try_click(btn):
+                    log_info(f"已关闭 Cookie 同意弹窗（按钮文案: {txt}）")
                     time.sleep(0.5)
                     return True
             except Exception:
