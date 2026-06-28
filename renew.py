@@ -247,7 +247,7 @@ def dismiss_cookie_consent(page, timeout=8) -> bool:
     return False
 
 
-
+def wait_for_site_ready(page) -> bool:
     for attempt in range(1, MAX_SITE_RETRIES + 1):
         log_info(f"加载 FreezeHost 首页 (尝试 {attempt}/{MAX_SITE_RETRIES})...")
         try:
