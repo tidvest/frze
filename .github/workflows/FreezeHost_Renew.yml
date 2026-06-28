@@ -12,6 +12,14 @@ on:
         type: choice
         options:
           - '1'
+      enable_recording:
+        description: '是否录屏（仅手动触发时有效）'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
 
 jobs:
   renew:
@@ -33,45 +41,42 @@ jobs:
       - name: 拉取仓库
         uses: actions/checkout@v4
 
-      - name: 安装 Python
+      - name: 设置 Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: 安装依赖
+      - name: 安装系统依赖
         run: |
-          pip install playwright
-          playwright install chromium --with-deps
-          sudo apt-get update
-          sudo apt-get install -y jq bc
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            xvfb ffmpeg curl unzip jq bc \
+            fonts-noto-cjk \
+            libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
+            libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \
+            libxfixes3 libxrandr2 libgbm1 \
+            libasound2t64 || sudo apt-get install -y -qq libasound2
 
-      - name: 启用 WARP 网络
-        uses: fscarmen/warp-on-actions@v1.3
-        with:
-          stack: dual
-          mode: client
-
-      - name: 修复 DNS
+      - name: 安装 Python 依赖
         run: |
-          echo "[INFO] 停用 systemd-resolved，直连 DNS..."
+          pip install "cloakbrowser[geoip]>=0.4.1" playwright
+          python -c "from cloakbrowser import ensure_binary; ensure_binary()"
 
-          sudo systemctl stop systemd-resolved 2>/dev/null || true
-          sudo systemctl disable systemd-resolved 2>/dev/null || true
-
-          sudo rm -f /etc/resolv.conf
-          echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 1.0.0.1" | sudo tee /etc/resolv.conf
-
-          sudo chattr +i /etc/resolv.conf 2>/dev/null || true
-          sleep 2
-
-          echo "[INFO] DNS 测试:"
-          nslookup free.freezehost.pro 1.1.1.1 || echo "[WARN] 解析失败"
-
+      - name: 下载并启动 Xray 代理
+        env:
+          V2RAY_CONFIG: ${{ secrets.V2RAY_CONFIG }}
+        run: |
+          curl -sL https://github.com/XTLS/Xray-core/releases/download/v25.5.16/Xray-linux-64.zip -o xray.zip
+          unzip xray.zip && chmod +x xray
+          echo "$V2RAY_CONFIG" > config.json
+          ./xray run -c config.json &
+          sleep 5
+          echo "直连 IP："
+          curl -s --max-time 5 ifconfig.me
           echo ""
-          echo "[INFO] 当前出口 IP:"
-          curl -s --max-time 10 https://api.ipify.org && echo
-          echo "[INFO] WARP Trace:"
-          curl -s --max-time 10 https://www.cloudflare.com/cdn-cgi/trace | grep -E 'ip=|warp=|loc=' || true
+          echo "代理 IP（SOCKS5 127.0.0.1:10808）："
+          curl -s --max-time 5 --socks5 127.0.0.1:10808 ifconfig.me
+          echo ""
 
       - name: 设置 Discord Token
         run: |
@@ -84,65 +89,103 @@ jobs:
           FREEZEHOST_DISCORD_TOKEN: ${{ env.DISCORD_TOKEN }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          DISPLAY: ":99"
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          GALLIUM_DRIVER: "llvmpipe"
+          ENABLE_RECORDING: ${{ github.event.inputs.enable_recording }}
         run: |
-          echo "使用 Token 编号: 1"
-          python renew.py 2>&1 | tee renew.log
+          # 判断是否录屏
+          if [ "$ENABLE_RECORDING" = "true" ]; then
+            DO_RECORD=true
+            echo "📹 录屏已开启"
+          else
+            DO_RECORD=false
+            echo "📹 录屏已关闭（定时任务默认不录屏）"
+          fi
+
+          # 启动 Xvfb 虚拟显示器（CloakBrowser headed 模式必须）
+          Xvfb :99 -screen 0 1280x753x24 +extension RANDR &
+          XVFB_PID=$!
+          sleep 2
+          DISPLAY=:99 xdpyinfo > /dev/null 2>&1 && echo "Xvfb 就绪" || echo "Xvfb 启动异常"
+
+          # 按需启动录屏
+          RECORD_PID=""
+          if [ "$DO_RECORD" = "true" ]; then
+            ffmpeg -f x11grab -video_size 1280x753 -framerate 15 -i :99 \
+              -codec:v libx264 -preset ultrafast -crf 28 \
+              -pix_fmt yuv420p -movflags +faststart /tmp/recording.mp4 \
+              > /tmp/ffmpeg.log 2>&1 &
+            RECORD_PID=$!
+            sleep 3
+            echo "录屏进程 PID: $RECORD_PID"
+          fi
+
+          # 运行续期脚本
+          timeout 600 python renew.py 2>&1 | tee renew.log
+
+          echo "=== 截图目录内容 ==="
+          ls -la ./screenshots/ || echo "截图目录不存在"
+
+          # 停止录屏
+          if [ -n "$RECORD_PID" ]; then
+            sleep 2
+            kill $RECORD_PID 2>/dev/null || true
+            wait $RECORD_PID 2>/dev/null || true
+            VIDEO_SIZE=$(stat -c%s /tmp/recording.mp4 2>/dev/null || echo 0)
+            echo "录像文件大小: ${VIDEO_SIZE} bytes"
+          fi
+
+          kill $XVFB_PID 2>/dev/null || true
 
       - name: 提取剩余天数（取所有服务器的最小值）
         id: extract_days
         if: success()
         run: |
           set -e
-          
+
           MIN_DAYS=""
-          
-          # 优先从 renew_result.json 读取（若存在）
+
           if [ -f "renew_result.json" ]; then
             MIN_DAYS=$(jq -r '.min_remaining_days // empty' renew_result.json)
             if [ -n "$MIN_DAYS" ]; then
               echo "✅ 从 renew_result.json 读取最小剩余天数: $MIN_DAYS"
             fi
           fi
-          
-          # 其次从 renew.log 提取所有剩余天数，取最小值
+
           if [ -z "$MIN_DAYS" ] && [ -f "renew.log" ]; then
             echo "📋 从 renew.log 提取所有服务器剩余天数："
-            
             MIN_DAYS=""
             while IFS= read -r line; do
               DAYS=$(echo "$line" | grep -oP '\d+(?=\s*DAYS?)' || echo "0")
               HOURS=$(echo "$line" | grep -oP '\d+\.?\d*(?=\s*HOURS?)' || echo "0")
-              
               if [ "$DAYS" != "0" ] || [ "$HOURS" != "0" ]; then
                 TOTAL=$(echo "scale=6; $DAYS + ($HOURS / 24)" | bc)
                 echo "  - $DAYS 天 + $HOURS 小时 = $TOTAL 天"
-                
                 if [ -z "$MIN_DAYS" ] || (( $(echo "$TOTAL < $MIN_DAYS" | bc -l) )); then
                   MIN_DAYS="$TOTAL"
                 fi
               fi
             done < <(grep -E "续期状态: .* DAYS? AND .* HOURS? REMAINING" renew.log || true)
-            
             if [ -n "$MIN_DAYS" ]; then
               echo "✅ 最小剩余天数: $MIN_DAYS"
             fi
           fi
-          
-          # 如果都没找到，退出
+
           if [ -z "$MIN_DAYS" ] || [ "$MIN_DAYS" = "0" ]; then
             echo "::warning::未找到有效的剩余时间，跳过 workflow 更新"
             echo "skip_update=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          
+
           echo "remaining_days=$MIN_DAYS" >> "$GITHUB_OUTPUT"
           echo "skip_update=false" >> "$GITHUB_OUTPUT"
           echo "::notice::剩余天数（最小值）: $MIN_DAYS"
-          
+
           mkdir -p /tmp/renew_data
           echo "$MIN_DAYS" > /tmp/renew_data/remaining_days.txt
 
-      - name: 拉取仓库
+      - name: 拉取仓库（用于更新 cron）
         if: success() && steps.extract_days.outputs.skip_update != 'true'
         uses: actions/checkout@v4
         with:
@@ -156,9 +199,8 @@ jobs:
         run: |
           set -e
 
-          # 读取剩余天数（优先 output，其次临时文件）
           REMAINING_DAYS="${{ steps.extract_days.outputs.remaining_days }}"
-          
+
           if [ -z "$REMAINING_DAYS" ] && [ -f "/tmp/renew_data/remaining_days.txt" ]; then
             REMAINING_DAYS=$(cat /tmp/renew_data/remaining_days.txt)
           fi
@@ -166,7 +208,6 @@ jobs:
           echo "剩余天数: $REMAINING_DAYS"
           echo "Token 编号: 1"
 
-          # 计算下次运行时间（到期前 6 天）
           if (( $(echo "$REMAINING_DAYS > 6" | bc -l) )); then
             DAYS_UNTIL_NEXT_RUN=$(echo "$REMAINING_DAYS - 6" | bc)
           else
@@ -186,79 +227,73 @@ jobs:
           echo "::notice::📅 下次运行: $NEXT_DATE UTC"
           echo "::notice::⏰ 新 Cron: $NEW_CRON"
 
-          # 切换到 workflow_repo 目录
           cd workflow_repo
 
-          # 从 github.workflow_ref 提取当前 workflow 文件路径
           WORKFLOW_FILE=$(echo "${{ github.workflow_ref }}" | sed -E 's|^[^/]+/[^/]+/(\.github/workflows/[^@]+)@.*|\1|')
-
           echo "::notice::📄 当前 workflow 文件: $WORKFLOW_FILE"
 
           if [ ! -f "$WORKFLOW_FILE" ]; then
             echo "::error::文件不存在: $WORKFLOW_FILE"
-            echo "::group::.github/workflows 目录内容"
             ls -la .github/workflows/
-            echo "::endgroup::"
             exit 1
           fi
 
-          # 查找 cron 行并更新
           TARGET_PATTERN="FREEZEHOST_DISCORD_TOKEN_1"
           LINE_NUM=$(grep -n "$TARGET_PATTERN" "$WORKFLOW_FILE" | cut -d: -f1 | head -n1)
 
           if [ -z "$LINE_NUM" ]; then
             echo "::error::找不到 $TARGET_PATTERN 对应行"
-            echo "::group::文件内容"
             nl -ba "$WORKFLOW_FILE"
-            echo "::endgroup::"
             exit 1
           fi
 
           echo "::notice::更新第 $LINE_NUM 行"
-
-          echo "::group::原始行"
           sed -n "${LINE_NUM}p" "$WORKFLOW_FILE"
-          echo "::endgroup::"
 
-          # 替换指定行
           sed -i "${LINE_NUM}c\\    - cron: '$NEW_CRON'   # FREEZEHOST_DISCORD_TOKEN_1 - 下一次: $NEXT_DATE UTC" "$WORKFLOW_FILE"
 
-          echo "::group::修改后"
           sed -n "${LINE_NUM}p" "$WORKFLOW_FILE"
-          echo "::endgroup::"
 
-          # 检查是否有变化
           if git diff --quiet "$WORKFLOW_FILE"; then
             echo "::notice::没有变化需要提交"
             exit 0
           fi
 
-          echo "::group::完整修改内容"
           git diff "$WORKFLOW_FILE"
-          echo "::endgroup::"
 
-          # 提交并推送
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add "$WORKFLOW_FILE"
-          
+
           git commit -m "自动调整 FREEZEHOST_DISCORD_TOKEN_1 下次续期时间" \
                      -m "下次运行: $NEXT_DATE UTC" \
                      -m "Cron: $NEW_CRON" \
                      -m "剩余天数（最小值）: $REMAINING_DAYS"
-          
+
           git remote set-url origin "https://x-access-token:${{ secrets.REPO_TOKEN }}@github.com/${{ github.repository }}.git"
           git push
 
           echo "::notice::✅ 成功更新 workflow 文件"
 
-#      - name: 上传截图
-#        if: always()
-#        uses: actions/upload-artifact@v4
-#        with:
-#          name: renew-screenshots-token-1
-#          path: screenshots/
-#          retention-days: 7
+      - name: 上传截图
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-${{ github.run_number }}
+          path: ./screenshots/*.png
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: 上传录屏（仅手动录屏时）
+        if: always() && github.event.inputs.enable_recording == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: recording-${{ github.run_number }}
+          path: |
+            /tmp/recording.mp4
+            /tmp/ffmpeg.log
+          if-no-files-found: ignore
+          retention-days: 3
 
       - name: 清理历史运行记录
         if: always()
