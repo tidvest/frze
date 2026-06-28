@@ -92,6 +92,7 @@ jobs:
           DISPLAY: ":99"
           LIBGL_ALWAYS_SOFTWARE: "1"
           GALLIUM_DRIVER: "llvmpipe"
+          PYTHONUNBUFFERED: "1"
           ENABLE_RECORDING: ${{ github.event.inputs.enable_recording }}
         run: |
           # 判断是否录屏
@@ -113,6 +114,7 @@ jobs:
           RECORD_PID=""
           if [ "$DO_RECORD" = "true" ]; then
             ffmpeg -f x11grab -video_size 1280x753 -framerate 15 -i :99 \
+              -vf "crop=trunc(iw/2)*2:trunc(ih/2)*2" \
               -codec:v libx264 -preset ultrafast -crf 28 \
               -pix_fmt yuv420p -movflags +faststart /tmp/recording.mp4 \
               > /tmp/ffmpeg.log 2>&1 &
@@ -121,8 +123,8 @@ jobs:
             echo "录屏进程 PID: $RECORD_PID"
           fi
 
-          # 运行续期脚本
-          timeout 600 python renew.py 2>&1 | tee renew.log
+          # 运行续期脚本（-u 禁用 stdout 缓冲，配合 PYTHONUNBUFFERED 保证日志实时输出）
+          timeout 600 python -u renew.py 2>&1 | tee renew.log
 
           echo "=== 截图目录内容 ==="
           ls -la ./screenshots/ || echo "截图目录不存在"
