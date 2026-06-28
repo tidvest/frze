@@ -220,7 +220,34 @@ def check_site_down(page) -> bool:
         return False
 
 
-def wait_for_site_ready(page) -> bool:
+def dismiss_cookie_consent(page, timeout=8) -> bool:
+    """
+    关闭 GDPR/广告联盟 Cookie 同意弹窗（常见于荷兰语/多语言 CMP 浮层）。
+    优先点"同意"类按钮，避免遮罩挡住后续的登录按钮。
+    """
+    consent_texts = [
+        "Toestemming geven", "Akkoord", "Accepteren",
+        "Accept all", "Accept", "I Agree", "I agree", "Agree",
+        "同意", "接受", "Allow all", "Allow",
+    ]
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for txt in consent_texts:
+            try:
+                btn = page.locator(f'button:has-text("{txt}")').first
+                if btn.is_visible(timeout=300):
+                    btn.click(timeout=1000)
+                    log_info(f"已关闭 Cookie 同意弹窗（按钮: {txt}）")
+                    time.sleep(0.5)
+                    return True
+            except Exception:
+                continue
+        time.sleep(0.3)
+    log_info("未检测到 Cookie 同意弹窗（或已自行关闭）")
+    return False
+
+
+
     for attempt in range(1, MAX_SITE_RETRIES + 1):
         log_info(f"加载 FreezeHost 首页 (尝试 {attempt}/{MAX_SITE_RETRIES})...")
         try:
@@ -609,8 +636,14 @@ def run():
             log_warn("站点宕机，本次跳过续期")
             return
 
+        # 关闭可能存在的 Cookie/GDPR 同意弹窗（曾遮挡登录按钮导致 confirm-login 一直 hidden）
+        dismiss_cookie_consent(page)
+
         # 点击 Discord 登录
         page.click('span.text-lg:has-text("Login with Discord")', timeout=15_000)
+
+        # 点击后再检测一次（弹窗有时延迟出现/二次出现）
+        dismiss_cookie_consent(page, timeout=4)
 
         confirm_btn = page.locator("button#confirm-login")
         confirm_btn.wait_for(state="visible")
