@@ -512,6 +512,263 @@ def fetch_internal_id(page, server_id: str) -> str | None:
         return None
 
 
+# ── CF Turnstile（续期页新增的 "Security Verification" 勾选框，逻辑移植自 zampto_auto.py） ──
+_cf_frame_seen_ts = {"seen": False, "first_check_ts": None}
+
+
+def _reset_cf_frame_seen():
+    _cf_frame_seen_ts["seen"] = False
+    _cf_frame_seen_ts["first_check_ts"] = None
+
+
+def turnstile_state(page, debug: bool = False) -> str:
+    # 以 challenges.cloudflare.com iframe 是否存在为主要依据，
+    # 比 DOM 结构更可靠
+    cf_iframe_exists = any(
+        "challenges.cloudflare.com" in (f.url or "") for f in page.frames
+    )
+    if cf_iframe_exists:
+        if not _cf_frame_seen_ts["seen"]:
+            _cf_frame_seen_ts["seen"] = True
+        token_ready = page.evaluate("""() => {
+            function deepQuery(root, sel) {
+                let el = root.querySelector(sel);
+                if (el) return el;
+                for (const host of root.querySelectorAll('*')) {
+                    if (host.shadowRoot) {
+                        el = deepQuery(host.shadowRoot, sel);
+                        if (el) return el;
+                    }
+                }
+                return null;
+            }
+            var tokenEl = deepQuery(document, 'input[name="cf-turnstile-response"]');
+            return !!(tokenEl && (tokenEl.value || '').length > 10);
+        }""")
+        if token_ready:
+            if debug:
+                log_info("[诊断/turnstile_state] cf_iframe_exists=True, token_ready=True → done")
+            return 'done'
+        if debug:
+            log_info("[诊断/turnstile_state] cf_iframe_exists=True, token_ready=False → unchecked")
+        return 'unchecked'
+
+    # iframe 不存在，检查验证卡片是否还在
+    # （FreezeHost 续期页样式："Security Verification" / "verify you are human"）
+    modal_state = page.evaluate("""() => {
+        var bodyTxt = document.body ? (document.body.innerText || '') : '';
+        if (bodyTxt.includes('Security Verification') ||
+            bodyTxt.includes('verify you are human') ||
+            bodyTxt.includes('geen robot') ||
+            bodyTxt.includes('Mensch')) return 'modal_open';
+        return 'no_modal';
+    }""")
+
+    if modal_state != 'modal_open':
+        if debug:
+            log_info(f"[诊断/turnstile_state] no cf_iframe, modal_state={modal_state} → done")
+        return 'done'
+
+    if _cf_frame_seen_ts["first_check_ts"] is None:
+        _cf_frame_seen_ts["first_check_ts"] = time.time()
+
+    if _cf_frame_seen_ts["seen"]:
+        if debug:
+            log_info("[诊断/turnstile_state] frame 曾出现过现已消失 → done")
+        return 'done'
+
+    elapsed = time.time() - _cf_frame_seen_ts["first_check_ts"]
+    if elapsed < 2.5:
+        if debug:
+            log_info(f"[诊断/turnstile_state] 等待 iframe 加载，elapsed={elapsed:.1f}s → verifying")
+        return 'verifying'
+
+    if debug:
+        log_info(f"[诊断/turnstile_state] 宽限期已过({elapsed:.1f}s)仍未见 iframe，验证卡片仍存在 → unchecked（强制点击）")
+    return 'unchecked'
+
+
+def click_turnstile_checkbox(page, timeout=10) -> bool:
+    def dump_frames(label: str):
+        try:
+            frames = page.frames
+            log_info(f"[诊断/{label}] 当前共 {len(frames)} 个 frame：")
+            for i, f in enumerate(frames):
+                url = (f.url or "about:blank")[:120]
+                log_info(f"  [{i}] {url}")
+        except Exception as e:
+            log_warn(f"[诊断/{label}] dump_frames 失败: {e}")
+
+    cf_frame = None
+    for _ in range(timeout * 2):
+        for f in page.frames:
+            if "challenges.cloudflare.com" in (f.url or ""):
+                cf_frame = f
+                break
+        if cf_frame:
+            break
+        time.sleep(0.5)
+
+    box = None
+    if cf_frame:
+        log_info(f"找到 Turnstile frame: {cf_frame.url[:120]}")
+        time.sleep(1)
+        try:
+            box = cf_frame.frame_element().bounding_box()
+            log_info(f"[诊断] frame bounding_box={box}")
+        except Exception as e:
+            log_warn(f"获取 Turnstile frame bounding_box 失败: {e}")
+    else:
+        log_warn("枚举 frames 未找到 Turnstile frame")
+        dump_frames("frame未找到")
+
+    if not box:
+        try:
+            iframe_el = page.locator('iframe[src*="challenges.cloudflare.com"]').first
+            box = iframe_el.bounding_box()
+            log_info(f"[诊断] 降级 iframe bounding_box={box}")
+        except Exception as e:
+            log_warn(f"降级定位 Turnstile iframe 失败: {e}")
+
+    if not box:
+        log_warn("未能定位 Turnstile checkbox，跳过点击")
+        dump_frames("定位失败")
+        return False
+
+    if not (0 < box["x"] < VIEWPORT_W and 0 < box["y"] < VIEWPORT_H):
+        log_warn(f"[诊断] bounding_box 坐标异常（{box}），跳过点击")
+        return False
+
+    x = box["x"] + 25
+    y = box["y"] + box["height"] / 2
+    try:
+        page.mouse.move(x, y)
+        time.sleep(random.uniform(0.2, 0.4))
+        page.mouse.click(x, y)
+        log_info(f"✅ 已点击 Turnstile checkbox ({x:.0f}, {y:.0f})")
+        return True
+    except Exception as e:
+        log_warn(f"点击 Turnstile checkbox 失败: {e}")
+        return False
+
+
+def wait_cf_turnstile(page, timeout=40) -> bool:
+    log_info("等待 Cloudflare Turnstile 验证...")
+    _reset_cf_frame_seen()
+
+    # ── 验证卡片/Turnstile 存在性检测（最多等 8s） ──────────────────
+    turnstile_or_modal_visible = False
+    for _retry in range(16):  # 16 × 0.5s = 8s
+        cf_iframe_exists = any(
+            "challenges.cloudflare.com" in (f.url or "") for f in page.frames
+        )
+        if cf_iframe_exists:
+            log_info("【Turnstile】检测到 challenges.cloudflare.com iframe，进入处理流程")
+            turnstile_or_modal_visible = True
+            break
+
+        dom_visible = page.evaluate("""() => {
+            var bodyTxt = document.body ? (document.body.innerText || '') : '';
+            return bodyTxt.includes('Security Verification') ||
+                   bodyTxt.includes('verify you are human') ||
+                   bodyTxt.includes('geen robot') ||
+                   bodyTxt.includes('Mensch');
+        }""")
+        if dom_visible:
+            log_info(f"【Turnstile】检测到验证卡片（DOM 结构，第 {_retry + 1} 次）")
+            turnstile_or_modal_visible = True
+            break
+
+        time.sleep(0.5)
+
+    if not turnstile_or_modal_visible:
+        log_warn("⚠️ 8s 内未检测到 Turnstile iframe 或验证卡片（可能未触发验证或已静默通过）")
+        return True
+
+    start = time.time()
+    deadline = start + timeout
+
+    # ── 阶段1：静默等待自动通过 ──────────────────────────────────
+    log_info("【Turnstile】阶段1：静默等待自动通过（最多 20s，稳定 unchecked 后提前进入点击）...")
+    silent_deadline = min(time.time() + 20, deadline)
+    last_state = None
+    stable_unchecked_count = 0
+    while time.time() < silent_deadline:
+        last_state = turnstile_state(page, debug=True)
+        if last_state == "done":
+            log_info("✅ CF Turnstile 静默通过")
+            return True
+        if last_state == "unchecked":
+            stable_unchecked_count += 1
+            if stable_unchecked_count >= 3:
+                log_info("【Turnstile】连续观察到稳定 unchecked，提前结束静默等待")
+                break
+        else:
+            stable_unchecked_count = 0
+        time.sleep(0.5)
+
+    if last_state == "verifying":
+        log_info("【Turnstile】阶段1.5：仍在验证中（转圈），额外等待最多 12s...")
+        grace_deadline = min(time.time() + 12, deadline)
+        while time.time() < grace_deadline:
+            state = turnstile_state(page)
+            if state == "done":
+                log_info("✅ CF Turnstile 静默通过（宽限期内）")
+                return True
+            if state == "unchecked":
+                log_info("【Turnstile】宽限期内 spinner 结束，转为未勾选状态")
+                break
+            time.sleep(0.5)
+
+    # ── 阶段2：主动点击，最多 3 次 ─────────────────────────────
+    log_info("【Turnstile】阶段2：未自动通过，主动点击勾选框...")
+    for attempt in range(1, 4):
+        if time.time() >= deadline:
+            break
+        state = turnstile_state(page)
+        if state == "done":
+            return True
+        if state == "verifying":
+            wait_until = min(time.time() + 5, deadline)
+            while time.time() < wait_until and turnstile_state(page) == "verifying":
+                time.sleep(0.5)
+            if turnstile_state(page) == "done":
+                return True
+
+        take_screenshot(page, f"cf_before_click_{attempt}")
+        clicked = click_turnstile_checkbox(page, timeout=min(8, max(1, int(deadline - time.time()))))
+        take_screenshot(page, f"cf_after_click_{attempt}")
+
+        if not clicked:
+            log_warn(f"第 {attempt} 次点击 Turnstile checkbox 失败")
+            time.sleep(1)
+            continue
+
+        click_wait_deadline = min(time.time() + 8, deadline)
+        while time.time() < click_wait_deadline:
+            if turnstile_state(page) == "done":
+                log_info(f"✅ CF Turnstile 验证完成（第 {attempt} 次点击后）")
+                return True
+            time.sleep(0.5)
+
+        log_warn(f"第 {attempt} 次点击后仍未验证通过，{'重试...' if attempt < 3 else '放弃重试'}")
+
+    # ── 阶段3：剩余时间继续被动等待 ──────────────────────────────
+    log_info("【Turnstile】阶段3：继续等待剩余时间...")
+    while time.time() < deadline:
+        if turnstile_state(page) == "done":
+            log_info("✅ CF Turnstile 验证完成")
+            return True
+        elapsed = int(time.time() - start)
+        if elapsed % 5 == 0:
+            log_info(f"  CF 等待中... {elapsed}s")
+        time.sleep(1)
+
+    log_error(f"CF Turnstile 验证超时（{timeout}s）")
+    take_screenshot(page, "cf_timeout")
+    return False
+
+
 def process_server(page, server_id: str) -> dict:
     server_url = f"{BASE_URL}/server-console?id={server_id}"
     result = dict(server_id=server_id, status="unknown", before=None, after=None,
@@ -554,6 +811,29 @@ def process_server(page, server_id: str) -> dict:
         # 执行续期（用 page.goto 直接跳转，不经过 navigate，避免误判 CF）
         log_info(f"[{server_id}] 执行续期跳转: {href}")
         page.goto(urljoin(page.url, href), wait_until="domcontentloaded")
+        take_screenshot(page, f"renew-page-{server_id}")
+
+        # 续期页新增了 Cloudflare Turnstile 人机验证（"Security Verification" 勾选框），
+        # 需要主动检测并点击，否则会一直卡在验证页导致续期失败
+        log_info(f"[{server_id}] 检测续期页人机验证...")
+        nav_detected = False
+        try:
+            turnstile_ok = wait_cf_turnstile(page, timeout=40)
+        except Exception as e:
+            err = str(e).lower()
+            if any(k in err for k in ("context", "destroyed", "navigation", "detached")):
+                nav_detected = True
+                turnstile_ok = True
+                log_info(f"[{server_id}] ✅ 检测到页面自动重载（验证通过后自动续期完成）: {e}")
+            else:
+                log_warn(f"[{server_id}] wait_cf_turnstile 异常: {e}")
+                turnstile_ok = False
+
+        if not (turnstile_ok or nav_detected):
+            log_warn(f"[{server_id}] ⚠️ 人机验证未确认通过，继续尝试读取跳转结果...")
+
+        take_screenshot(page, f"renew-after-cf-{server_id}")
+
         try:
             page.wait_for_url(lambda u: "/dashboard" in u or "/server-console" in u, timeout=30000)
         except Exception:
